@@ -1,0 +1,244 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: convert-and-train-hlt-nurd-ptrawv1-converter-collide
+  # aida-scout (not axol1tl): this job mounts collide2vsubset directly for the conversion
+  # step, so training runs in the same pod right after -- no HTTP hop needed, unlike the
+  # earlier two-job split (a separate axol1tl/axovol job that downloaded the converted .pt
+  # over the public collide2vsubset.nrp-nautilus.io mirror). aida-scout already has both
+  # A100 GPU nodes and wandb-secret (see aidascoutrepo/nrp/train/*.yaml), so nothing is lost
+  # by running the continuous_nuisance training here instead.
+  namespace: aida-scout
+spec:
+  priorityClassName: opportunistic
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      # affinity:
+        # nodeAffinity:
+        #   requiredDuringSchedulingIgnoredDuringExecution:
+        #     nodeSelectorTerms:
+        #     - matchExpressions:
+        #       - key: nvidia.com/gpu.product
+        #         operator: In
+        #         values:
+        #         - NVIDIA-H200-NVL
+      containers:
+        - name: convert-and-train
+          image: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              echo "=== Job started: $(date) ==="
+              python -c "import torch; print('CUDA:', torch.cuda.is_available(), '| Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+
+              which git > /dev/null || (apt-get update -qq && apt-get install -y -qq git)
+
+              # Covers both phases: awkward/uproot/pyarrow/tqdm/pyyaml for converterCollide.py,
+              # scipy/scikit-learn/matplotlib/wandb for continuous_nuisance's train/eval scripts.
+              pip install --quiet awkward uproot pyarrow tqdm pyyaml scipy scikit-learn matplotlib wandb
+
+              # ── Step 1: convert collide-1m-ptrawv1.0 (melissa's fixed-sampling background
+              # subset) -> {'pf','label','obj'} .pt train/test split, via double_disco's
+              # converterCollide.py, "regionized" candidate schema (no L1T_PFCand in this
+              # dataset -- see converterCollide.py's COLLIDE2V_SCHEMAS). Own checkout under
+              # /tmp -- ephemeral, nothing downstream needs it to persist (matches
+              # preprocess_collide2v_test_smcocktail.yaml's own convention).
+              echo "=== Step 1: convert collide-1m-ptrawv1.0: $(date) ==="
+              cd /tmp
+              git clone --quiet https://github.com/ellisonscheuller/double_disco_hlt.git
+              cd double_disco_hlt
+              export PYTHONPATH=src
+              export WANDB_MODE=disabled
+              python converterCollide.py --config configs/data_collide2v_ptrawv1.yaml --overwrite
+              du -sh /collide2vsubset/escheuller/collide2v_ptrawv1_0_tensors/*
+              echo "=== Conversion done: $(date) ==="
+
+              # ── Step 1b: convert eval-only signal samples (ttH_incl, HH_bbgammagamma,
+              # tttt_incl) from the same collide-1m-ptrawv1.0 sample_dir. Single combined
+              # output file, labels 0/1/2 = ttH/HHbbgg/tttt (data_collide2v_signal_ptrawv1.yaml's
+              # own samples: order) -- unrelated to the background label indices above.
+              echo "=== Step 1b: convert signal samples (ttH/HH/tttt): $(date) ==="
+              python converterCollide.py --config configs/data_collide2v_signal_ptrawv1.yaml --overwrite
+              du -sh /collide2vsubset/escheuller/collide2v_signal_ptrawv1_0/*
+              echo "=== Signal conversion done: $(date) ==="
+
+              # ── Step 2/3/4: AE + NURD training + legacy eval, continuous_nuisance repo.
+              # Own checkout on collide2vsubset (persists checkpoints/ between pods, matches
+              # aidascoutrepo/nrp's own convention for training jobs).
+              mkdir -p /collide2vsubset/escheuller/collide2v_ptrawv1_0
+              cd /collide2vsubset/escheuller/collide2v_ptrawv1_0
+              if [ -d cont_nuisance_ellison ]; then
+                git -C cont_nuisance_ellison checkout main
+                git -C cont_nuisance_ellison pull --ff-only
+              else
+                git clone --quiet https://github.com/ellisonscheuller/cont_nuisance_ellison.git
+              fi
+              cd cont_nuisance_ellison
+              pip install --quiet -r nrp/requirements_nrp.txt
+              CODE_COMMIT="$(git rev-parse HEAD)"
+
+              export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+              # QCD gen weights (--gen_weight_path) intentionally omitted throughout -- not
+              # relevant here (no mequinna-style weight file exists for this dataset);
+              # load_generator_weights defaults every event to unit physics weight when omitted.
+              # Label order is DY=0, QCD=1, WJetsToLNu=2, WJetsToQQ=3, ZJetsToQQ=4, ZJetsTobb=5,
+              # ZJetsTocc=6, ZJetsTovv=7, TTHadronic=8, TTLeptonic=9, TTSemiLeptonic=10
+              # (data_collide2v_ptrawv1.yaml's samples: order, 11 classes) -- --qcd_label 1
+              # matches throughout since QCD is intentionally kept at index 1.
+              TRAIN_PT=/collide2vsubset/escheuller/collide2v_ptrawv1_0_tensors/collide2v_ptrawv1_0_train.pt
+              TEST_PT=/collide2vsubset/escheuller/collide2v_ptrawv1_0_tensors/collide2v_ptrawv1_0_test.pt
+              SIGNAL_PT=/collide2vsubset/escheuller/collide2v_signal_ptrawv1_0/collide2v_signal_ptrawv1_0.pt
+              CLASS_NAMES=DY,QCD,WJetsToLNu,WJetsToQQ,ZJetsToQQ,ZJetsTobb,ZJetsTocc,ZJetsTovv,TTHadronic,TTLeptonic,TTSemiLeptonic
+
+              AE_EXP=ae_ptrawv1_0_converterCollide
+              NURD_EXP=hlt_nurd_ptrawv1_0_converterCollide
+              BASELINE_EXP=hlt_nodecorr_ptrawv1_0_converterCollide
+              AE_CKPT=checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth
+              NURD_CKPT=checkpoints/hlt/hlt/$NURD_EXP/checkpoint_main.pth.tar
+              BASELINE_CKPT=checkpoints/hlt/hlt/$BASELINE_EXP/checkpoint_main.pth.tar
+              NURD_EPOCHS=40
+
+              # Everything below mirrors slurm/submit_engineer_train.sbatch's real "engineer
+              # campaign" invocation (the one launch_engineer_campaign.sh actually runs) as
+              # closely as a single k8s job can, not the older/simpler nrp/train_hlt_closure_nrp.yaml
+              # pattern -- --patience/--lr_schedule_epochs/--info_warmup_epochs/--info_ramp_epochs/
+              # --code_commit added to match, INFO_WARMUP_EPOCHS=0/INFO_RAMP_EPOCHS=0 (immediate
+              # penalty, no ramp) matching that script's own defaults.
+              echo "=== Step 2: AE pretraining: $(date) ==="
+              python train_ae.py \
+                --data         $TRAIN_PT \
+                --qcd_label    1 \
+                --epochs       100 \
+                --batch_size   8192 \
+                --lr           1e-3 \
+                --latent_dim   16 \
+                --enc_nodes    512 256 \
+                --dec_nodes    256 512 \
+                --exp_name     $AE_EXP \
+                --project_name hlt \
+                --manualSeed   42
+              echo "=== AE pretraining done: $(date) ==="
+
+              echo "=== Step 3: NURD continuous-nuisance training: $(date) ==="
+              python train_hlt.py \
+                --data         $TRAIN_PT \
+                --ae_ckpt      $AE_CKPT \
+                --qcd_label    1 \
+                --balance_strata 20 \
+                --epochs       $NURD_EPOCHS \
+                --lr_schedule_epochs $NURD_EPOCHS \
+                --batch_size   8192 \
+                --num_workers  0 \
+                --lr           1e-4 \
+                --critic_lr    1e-3 \
+                --critic_steps 3 \
+                --lambda_info  1.0 \
+                --info_warmup_epochs 0 \
+                --info_ramp_epochs   0 \
+                --contrast_weight 0.3 \
+                --contrast_temp   0.05 \
+                --weight_decay 5e-3 \
+                --embed_size   128 \
+                --latent_dim   6 \
+                --proj_dim     6 \
+                --num_heads    8 \
+                --num_layers   4 \
+                --dim_ff       512 \
+                --linear_dim   16 \
+                --patience     15 \
+                --exp_name     $NURD_EXP \
+                --project_name hlt \
+                --manualSeed   42 \
+                --code_commit  "$CODE_COMMIT"
+              echo "=== NURD training done: $(date) ==="
+
+              # ── Step 3b: baseline contrastive-only encoder, --lambda_info 0 so the critic
+              # applies no decorrelation pressure -- identical hyperparameters otherwise.
+              # Purely a diagnostic for eval_abcd_nurd.py's --baseline_ckpt PCA comparison
+              # plot (pca_no_decorrelation_kde.png); this checkpoint plays no role in the
+              # ABCD closure statistic below.
+              echo "=== Step 3b: baseline (no-decorrelation) training: $(date) ==="
+              python train_hlt.py \
+                --data         $TRAIN_PT \
+                --ae_ckpt      $AE_CKPT \
+                --qcd_label    1 \
+                --balance_strata 20 \
+                --epochs       $NURD_EPOCHS \
+                --lr_schedule_epochs $NURD_EPOCHS \
+                --batch_size   8192 \
+                --num_workers  0 \
+                --lr           1e-4 \
+                --critic_lr    1e-3 \
+                --critic_steps 3 \
+                --lambda_info  0.0 \
+                --info_warmup_epochs 0 \
+                --info_ramp_epochs   0 \
+                --contrast_weight 0.3 \
+                --contrast_temp   0.05 \
+                --weight_decay 5e-3 \
+                --embed_size   128 \
+                --latent_dim   6 \
+                --proj_dim     6 \
+                --num_heads    8 \
+                --num_layers   4 \
+                --dim_ff       512 \
+                --linear_dim   16 \
+                --patience     15 \
+                --exp_name     $BASELINE_EXP \
+                --project_name hlt \
+                --manualSeed   42 \
+                --code_commit  "$CODE_COMMIT"
+              echo "=== Baseline training done: $(date) ==="
+
+              # Legacy-only closure eval -- NOT the held-out protocol (submit_engineer_dual_eval.sbatch's
+              # --test_pt/--gen_weight_path/--reference_pt/--reference_weight_path combination): that's
+              # known broken right now, and this dataset has no gen-weight file for it anyway (held-out
+              # mode requires --reference_weight_path). Legacy mode (--test_pt only, no reference/gen
+              # weight args -- see eval_abcd_nurd.py's --reference_pt help text on preserving "legacy
+              # same-sample behavior" when omitted) needs nothing this dataset doesn't already have:
+              # our own converterCollide.py-built test split.
+              echo "=== Step 4: legacy ABCD closure eval: $(date) ==="
+              mkdir -p outputs/ptrawv1_0_converterCollide_eval/legacy
+              python eval_abcd_nurd.py \
+                --ckpt         $NURD_CKPT \
+                --ae_ckpt      $AE_CKPT \
+                --test_pt      $TEST_PT \
+                --signal_pt    $SIGNAL_PT \
+                --signal_class_names ttH,HHbbgg,tttt \
+                --baseline_ckpt $BASELINE_CKPT \
+                --class_names  $CLASS_NAMES \
+                --outdir       outputs/ptrawv1_0_converterCollide_eval/legacy \
+                --n_pca        6 \
+                --qcd_label    1 \
+                --wandb_run_name ptrawv1_0_converterCollide_legacy
+              echo "=== Legacy eval done: $(date) ==="
+
+              echo "=== Job finished: $(date) ==="
+          env:
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-secret
+                  key: WANDB_API_KEY
+          resources:
+            # Max of the two original jobs' own sizing: 192-256Gi/8-16cpu (conversion, QCD's
+            # raw-pT candidate multiplicity) + 1 A100 (training) -- both phases share one pod.
+            requests:
+              memory: "192Gi"
+              cpu: "8"
+              nvidia.com/h200: "1"
+            limits:
+              memory: "256Gi"
+              cpu: "16"
+              nvidia.com/h200: "1"
+          volumeMounts:
+            - name: collide2vsubset
+              mountPath: /collide2vsubset
+      volumes:
+        - name: collide2vsubset
+          persistentVolumeClaim:
+            claimName: collide2vsubset
