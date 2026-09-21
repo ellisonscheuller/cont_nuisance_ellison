@@ -736,6 +736,38 @@ def ABCD(config):
             "Diag/axis2_qcd_tail_unique_frac": n_unique_tail / max(tail.size, 1),
         })
 
+        # Full-range plateau check: the p99 tail check above only covers the
+        # top 1%, so a tied cluster sitting mid-range (e.g. a large block of
+        # QCD events collapsing onto ~the same MD score around p70-p90)
+        # wouldn't show up there. That's exactly the shape a scan-axis cutoff
+        # at a fixed percentile (independent of the other axis) would need:
+        # once the scan crosses into the tied block, the actual threshold
+        # value stops moving and the region composition can flip abruptly.
+        qs = [0.50, 0.60, 0.65, 0.70, 0.75, 0.78, 0.80, 0.82, 0.85, 0.90, 0.95, 0.98]
+        qvals = np.quantile(axis2_qcd, qs)
+        print(
+            "Axis2 (QCD) quantile ladder: "
+            + ", ".join(f"p{q:.2f}={v:.6g}" for q, v in zip(qs, qvals)),
+            flush=True)
+
+        sorted_axis2 = np.sort(axis2_qcd)
+        uniq_vals, uniq_counts = np.unique(sorted_axis2, return_counts=True)
+        top_cluster_idx = np.argsort(uniq_counts)[::-1][:5]
+        print("Largest tied clusters in axis2 (QCD):", flush=True)
+        for idx in top_cluster_idx:
+            v, c = uniq_vals[idx], uniq_counts[idx]
+            lo = np.searchsorted(sorted_axis2, v, side="left") / sorted_axis2.size
+            hi = np.searchsorted(sorted_axis2, v, side="right") / sorted_axis2.size
+            print(
+                f"  value={v:.6g} count={c} ({100.0*c/sorted_axis2.size:.2f}%) "
+                f"percentile span=[{lo:.3f}, {hi:.3f}]",
+                flush=True)
+        biggest_idx = top_cluster_idx[0]
+        wandb.log({
+            "Diag/axis2_qcd_biggest_cluster_value": float(uniq_vals[biggest_idx]),
+            "Diag/axis2_qcd_biggest_cluster_frac": float(uniq_counts[biggest_idx]) / sorted_axis2.size,
+        })
+
         # Eigenvalue spectrum of the fitted QCD whitening transform -- a
         # near-zero eigenvalue divides by ~0 in _kernel_whiten and amplifies
         # noise along that direction instead of saturating; that's a
