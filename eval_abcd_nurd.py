@@ -738,12 +738,12 @@ def ABCD(config):
 
         # Full-range plateau check: the p99 tail check above only covers the
         # top 1%, so a tied cluster sitting mid-range (e.g. a large block of
-        # QCD events collapsing onto ~the same MD score around p70-p90)
-        # wouldn't show up there. That's exactly the shape a scan-axis cutoff
-        # at a fixed percentile (independent of the other axis) would need:
-        # once the scan crosses into the tied block, the actual threshold
-        # value stops moving and the region composition can flip abruptly.
-        qs = [0.50, 0.60, 0.65, 0.70, 0.75, 0.78, 0.80, 0.82, 0.85, 0.90, 0.95, 0.98]
+        # QCD events collapsing onto ~the same MD score around p88) wouldn't
+        # show up there. That's exactly the shape a scan-axis cutoff at a
+        # fixed percentile (independent of the other axis) would need: once
+        # the scan crosses into the tied block, the actual threshold value
+        # stops moving and the region composition can flip abruptly.
+        qs = [0.50, 0.60, 0.70, 0.80, 0.84, 0.86, 0.87, 0.88, 0.89, 0.90, 0.92, 0.95, 0.98]
         qvals = np.quantile(axis2_qcd, qs)
         print(
             "Axis2 (QCD) quantile ladder: "
