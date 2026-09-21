@@ -712,6 +712,60 @@ def ABCD(config):
     axis2_qcd = axis2_bkg[qcd_only]
     print(f"QCD events for ABCD: {qcd_only.sum()}", flush=True)
 
+    # ── axis-2 tail diagnostic: kernel-PCA MD is bounded (RBF similarity to
+    # every reference point vanishes for far events), unlike linear-PCA MD.
+    # A saturation plateau shows up here as many tied values at the top of
+    # the range, which quantile thresholds can't split -- that's the flat
+    # band the 2D closure scan shows near high p1/p2.
+    if not use_logit:
+        n_feat = latents_masked.shape[1]
+        effective_gamma = pca_gamma if pca_gamma is not None else 1.0 / n_feat
+        max_val = float(axis2_qcd.max())
+        n_tied_at_max = int(np.isclose(axis2_qcd, max_val, rtol=0, atol=1e-6).sum())
+        top1pct = np.quantile(axis2_qcd, 0.99)
+        tail = axis2_qcd[axis2_qcd >= top1pct]
+        n_unique_tail = np.unique(tail).size
+        print(
+            f"Axis2 (QCD) tail check [{pca_kernel} kernel, gamma={effective_gamma:.4g}]: "
+            f"max={max_val:.4g}, {n_tied_at_max} events tied at max, "
+            f"{n_unique_tail}/{tail.size} unique values above the p99 threshold",
+            flush=True)
+        wandb.log({
+            "Diag/axis2_qcd_max": max_val,
+            "Diag/axis2_qcd_n_tied_at_max": n_tied_at_max,
+            "Diag/axis2_qcd_tail_unique_frac": n_unique_tail / max(tail.size, 1),
+        })
+
+        # Eigenvalue spectrum of the fitted QCD whitening transform -- a
+        # near-zero eigenvalue divides by ~0 in _kernel_whiten and amplifies
+        # noise along that direction instead of saturating; that's a
+        # different failure mode (spiky, not tied) with a different fix
+        # (fewer components / larger fit sample) than kernel saturation.
+        eigvals = md_kpca.eigenvalues_
+        print(
+            f"QCD KernelPCA eigenvalues: min={eigvals.min():.4g}, "
+            f"max={eigvals.max():.4g}, ratio={eigvals.max() / max(eigvals.min(), 1e-12):.4g}",
+            flush=True)
+        wandb.log({
+            "Diag/qcd_kpca_eig_min": float(eigvals.min()),
+            "Diag/qcd_kpca_eig_max": float(eigvals.max()),
+        })
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        bins = (np.geomspace(axis2_qcd[axis2_qcd > 0].min(), max_val, 101)
+                if axis2_log_scale else np.linspace(axis2_qcd.min(), max_val, 101))
+        ax.hist(axis2_qcd, bins=bins)
+        if axis2_log_scale:
+            ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel(axis2_label)
+        ax.set_ylabel("QCD events")
+        ax.set_title(f"Axis2 tail diagnostic ({pca_kernel} kernel, gamma={effective_gamma:.4g})")
+        out_diag = os.path.join(plot_dir, "axis2_qcd_tail_diag.png")
+        fig.savefig(out_diag, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        wandb.log({"Diag/axis2_qcd_hist": wandb.Image(out_diag)})
+
     # ── gen weights (QCD only, for weighted ABCD) ─────────────────────────────
     gen_weights_qcd = None
     if test_physics is not None:
