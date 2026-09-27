@@ -5,39 +5,31 @@ import torch
 
 sys.modules.setdefault("wandb", types.ModuleType("wandb"))
 from eval_abcd_nurd import (
-    fit_class_kernel_transform, _kernel_whiten, checkpoint_reference_indices)
+    fit_class_transform, _linear_whiten, checkpoint_reference_indices)
 
 
-def test_weighted_kernel_pca_biases_fit_sample_toward_higher_weight():
+def test_weighted_pca_biases_mean_toward_higher_weight():
     embeddings = np.asarray([[0.0, 0.0], [2.0, 0.0], [10.0, 1.0]])
     mask = np.asarray([True, True, False])
     weights = np.asarray([1.0, 3.0, 100.0])  # third point excluded by mask
-    kpca = fit_class_kernel_transform(
-        embeddings, mask, n_components=1, class_name="QCD",
-        weights=weights, fit_sample_cap=4000, seed=0)
+    mu, W = fit_class_transform(
+        embeddings, mask, n_pca=None, class_name="QCD", weights=weights)
 
-    # KernelPCA has no native sample_weight, so a weighted fit is approximated
-    # by resampling with replacement proportional to `weights`. Reproduce the
-    # same first RNG draw the function makes internally (same seed, same
-    # first call) to check the resample lands close to the true proportion.
-    rng = np.random.default_rng(0)
-    ref_weights = weights[mask]
-    p = ref_weights / ref_weights.sum()
-    fit_idx = rng.choice(2, size=4000, replace=True, p=p)
-    assert abs(fit_idx.mean() - p[1]) < 0.05
+    # unweighted mean of the masked points is [1, 0]; 3x weight on [2, 0]
+    # should pull mu[0] above 1.0.
+    assert mu[0] > 1.0
 
-    z = _kernel_whiten(kpca, embeddings[mask])
-    assert z.shape == (2, 1)
+    z = _linear_whiten(mu, W, embeddings[mask])
+    assert z.shape == (2, 2)
     assert np.isfinite(z).all()
 
 
-def test_unweighted_kernel_pca_whitens_reference_class():
+def test_unweighted_pca_whitens_reference_class():
     embeddings = np.asarray([[0.0, 0.0], [2.0, 0.0], [10.0, 1.0]])
     mask = np.asarray([True, True, False])
-    kpca = fit_class_kernel_transform(
-        embeddings, mask, n_components=1, class_name="QCD", fit_sample_cap=4000)
-    z = _kernel_whiten(kpca, embeddings)
-    assert z.shape == (3, 1)
+    mu, W = fit_class_transform(embeddings, mask, n_pca=None, class_name="QCD")
+    z = _linear_whiten(mu, W, embeddings)
+    assert z.shape == (3, 2)
     assert np.isfinite(z).all()
 
 

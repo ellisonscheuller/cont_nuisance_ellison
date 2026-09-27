@@ -2,12 +2,11 @@
 ABCD eval for the NURD contrastive checkpoint (hlt_nurd_con).
 
 Axis 1: AE reco loss (HLTAutoencoder, loaded from separate ae_ckpt)
-Axis 2: Mahalanobis distance in a kernel-PCA-whitened NURD latent space
-        (default) OR 1-P(QCD) classifier logit score (--axis2_logit)
+Axis 2: Mahalanobis distance in a PCA-whitened NURD latent space (default)
+        OR 1-P(QCD) classifier logit score (--axis2_logit)
 
 All PCA-embedding plots (pca_kde_embeddings.png, pca_corner.png,
-hist2d_pca_md_kde.png) are KDE contours rather than per-point scatter, and
-use KernelPCA (--pca_kernel/--pca_gamma) rather than linear PCA throughout.
+hist2d_pca_md_kde.png) are KDE contours rather than per-point scatter.
 
 Usage
 -----
@@ -35,7 +34,6 @@ import wandb
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from scipy.stats import binned_statistic, gaussian_kde
-from sklearn.decomposition import KernelPCA
 from matplotlib.lines import Line2D
 
 from models.hlt_con import HLTContrastiveModel
@@ -221,72 +219,35 @@ def build_class_colors(class_names, cmap_name=None):
     return {label: cmap(i % cmap.N) for i, label in enumerate(labels)}
 
 
-def _kernel_whiten(kpca, embeddings, chunk_size=20_000):
-    """Project through a fitted KernelPCA and whiten by sqrt(eigenvalue).
-
-    This is the kernel-PCA generalization of linear PCA whitening
-    (z = (x - mu) @ V / sqrt(L)): dividing each kernel-PCA component by the
-    sqrt of its eigenvalue gives unit-variance coordinates in which the
-    squared norm is the kernel-space analogue of Mahalanobis distance.
-
-    KernelPCA.transform materializes a dense (n_embeddings, n_fit_samples)
-    kernel matrix; at 1M-event scale that would be tens of GB in one call, so
-    this chunks over `embeddings` (transform cost is linear in n_embeddings).
-    """
-    scale = np.sqrt(np.clip(kpca.eigenvalues_, 1e-12, None))
-    n = embeddings.shape[0]
-    if n <= chunk_size:
-        return kpca.transform(embeddings) / scale
-    parts = [
-        kpca.transform(embeddings[start:start + chunk_size])
-        for start in range(0, n, chunk_size)
-    ]
-    return np.concatenate(parts, axis=0) / scale
+def _linear_whiten(mu, W, embeddings):
+    return (embeddings - mu) @ W
 
 
-def fit_class_kernel_transform(embeddings, mask, n_components, class_name,
-                                kernel="rbf", gamma=None, fit_sample_cap=5000,
-                                weights=None, seed=42):
-    """Fit a KernelPCA whitening transform on embeddings[mask].
-
-    KernelPCA fit/transform cost is quadratic in the fit-set size, so the
-    reference class is subsampled to `fit_sample_cap` points before fitting
-    (transform() is then applied to the full sample, which is linear in N).
-    KernelPCA has no native sample_weight support; a weighted fit is
-    approximated by resampling the reference points with replacement
-    proportional to `weights` before fitting -- exact for the unweighted case
-    used by the legacy (unit-weight) eval jobs.
-    """
+def fit_class_transform(embeddings, mask, n_pca, class_name, weights=None):
+    """Fit linear PCA whitening on embeddings[mask]. Returns (mu, W)."""
     ref = embeddings[mask]
-    n_ref = ref.shape[0]
-    rng = np.random.default_rng(seed)
-
+    print(f"  Fitting PCA whitening on {mask.sum()} {class_name} events (dim={ref.shape[1]})...", flush=True)
     if weights is None:
-        fit_n = min(n_ref, int(fit_sample_cap))
-        fit_idx = rng.choice(n_ref, size=fit_n, replace=False)
+        ref_weights = np.ones(ref.shape[0], dtype=np.float64)
     else:
         ref_weights = np.asarray(weights, dtype=np.float64)[mask]
         if not np.isfinite(ref_weights).all() or np.any(ref_weights < 0):
             raise ValueError("Reference weights must be finite and non-negative.")
-        weight_sum = ref_weights.sum()
-        if weight_sum <= 0:
-            raise ValueError(f"Reference class {class_name} has zero total weight.")
-        # Not capped by n_ref: sampling with replacement is exactly how a
-        # small/rare reference class still gets a full fit_sample_cap-sized
-        # weighted fit set.
-        fit_n = int(fit_sample_cap)
-        fit_idx = rng.choice(n_ref, size=fit_n, replace=True, p=ref_weights / weight_sum)
-    fit_points = ref[fit_idx]
-
-    requested = int(n_components) if n_components else ref.shape[1]
-    n_components_eff = max(1, min(requested, fit_points.shape[0] - 1))
-    print(f"  Fitting KernelPCA ({kernel}) whitening on {n_ref} {class_name} "
-          f"events (fit sample={fit_n}, components={n_components_eff})...", flush=True)
-
-    kpca = KernelPCA(n_components=n_components_eff, kernel=kernel, gamma=gamma,
-                      fit_inverse_transform=False, random_state=seed)
-    kpca.fit(fit_points)
-    return kpca
+    weight_sum = ref_weights.sum()
+    if weight_sum <= 0:
+        raise ValueError(f"Reference class {class_name} has zero total weight.")
+    ref_weights = ref_weights / weight_sum
+    mu = np.sum(ref * ref_weights[:, None], axis=0)
+    centered = ref - mu
+    cov = (centered * ref_weights[:, None]).T @ centered
+    L, V = np.linalg.eigh(cov)
+    if n_pca is not None:
+        V = V[:, -n_pca:]
+        L = L[-n_pca:]
+        print(f"    Using top {n_pca} PCA components", flush=True)
+    L = np.clip(L, 1e-6, None)
+    W = V / np.sqrt(L)
+    return mu, W
 
 
 def plot_kde_contours(ax, groups, log_x=False, log_y=False,
@@ -451,17 +412,16 @@ def compute_logit_axis2(logits, qcd_label=1):
 def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None,
                       bkg_labels=None, reference_pt=None,
                       reference_weights=None, reference_fit_indices=None,
-                      class_names=None, pca_kernel="rbf", pca_gamma=None,
-                      pca_kernel_fit_samples=5000):
+                      class_names=None):
     """
-    Embed all events, fit KernelPCA whitening per background class, return MD scores.
+    Embed all events, fit PCA whitening per background class, return MD scores.
 
     bkg_labels: list of class labels to use as reference.
       [1]       (default) → QCD-only MD.
       [0, 1, 3] → min-MD across three classes (element-wise minimum).
 
-    Returns (md [N], labels [N], kpca_qcd, latents [N,D], class_transforms).
-    class_transforms is a list of (label, kpca) — reuse for signal inference.
+    Returns (md [N], labels [N], mu_qcd, W_qcd, latents [N,D], class_transforms).
+    class_transforms is a list of (label, mu, W) — reuse for signal inference.
     """
     class_names = class_names or {}
     if bkg_labels is None:
@@ -492,30 +452,28 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None,
         if mask.sum() < 10:
             print(f"  WARNING: class {cls} has only {mask.sum()} events — skipping", flush=True)
             continue
-        kpca = fit_class_kernel_transform(
+        mu, W = fit_class_transform(
             reference_latents, mask, n_pca,
             class_names.get(cls, str(cls)),
-            kernel=pca_kernel, gamma=pca_gamma,
-            fit_sample_cap=pca_kernel_fit_samples,
             weights=reference_weights)
-        class_transforms.append((cls, kpca))
+        class_transforms.append((cls, mu, W))
 
     if not class_transforms:
         raise RuntimeError("No background classes with enough events.")
 
     md_per_class = []
-    for cls, kpca_c in class_transforms:
-        z_c = _kernel_whiten(kpca_c, latents)
+    for cls, mu_c, W_c in class_transforms:
+        z_c = _linear_whiten(mu_c, W_c, latents)
         md_per_class.append((z_c * z_c).sum(axis=1))
     md = np.stack(md_per_class, axis=0).min(axis=0).astype(np.float32)
 
     if len(class_transforms) > 1:
-        print(f"  Min-MD across classes {[c for c, _ in class_transforms]}", flush=True)
+        print(f"  Min-MD across classes {[c for c, _, _ in class_transforms]}", flush=True)
 
     qcd_entry = next((t for t in class_transforms if t[0] == 1), class_transforms[0])
-    kpca_qcd = qcd_entry[1]
+    mu_qcd, W_qcd = qcd_entry[1], qcd_entry[2]
 
-    return (md, labels, kpca_qcd, latents, class_transforms,
+    return (md, labels, mu_qcd, W_qcd, latents, class_transforms,
             reference_latents, reference_labels)
 
 
@@ -638,10 +596,6 @@ def ABCD(config):
     axis2_label = "1-P(QCD)" if use_logit else "NURD Contrastive score (MD)"
     axis2_log_scale = not use_logit   # MD → log y; logit ∈ [0,1] → linear y
 
-    pca_kernel = config.get("pca_kernel", "rbf")
-    pca_gamma = config.get("pca_gamma")
-    pca_kernel_fit_samples = int(config.get("pca_kernel_fit_samples", 5000))
-
     # always need latents for PCA embedding plots; get logits too when requested
     if use_logit:
         print("Axis 2 = 1-P(QCD) logit mode.", flush=True)
@@ -649,7 +603,7 @@ def ABCD(config):
             model, config["test_pt"], device, return_logits=True)
         con_bkg = compute_logit_axis2(logits_all, qcd_label=qcd_label)
         class_transforms = []   # not used in logit mode
-        md_kpca = None
+        md_mu = md_W = None
         if reference_pt:
             reference_latents, reference_logits, reference_labels = embed_pf(
                 model, reference_pt, device, return_logits=True)
@@ -661,7 +615,7 @@ def ABCD(config):
             print("Min-MD mode: axis 2 = min-MD across labels "
                   f"{bkg_labels}", flush=True)
         print("Computing contrastive MD scores (bkg)...", flush=True)
-        (con_bkg, labels, md_kpca, latents_all, class_transforms,
+        (con_bkg, labels, md_mu, md_W, latents_all, class_transforms,
          reference_latents, reference_labels) = compute_md_scores(
             model, config["test_pt"], device,
             n_pca=config.get("n_pca"),
@@ -670,14 +624,11 @@ def ABCD(config):
             reference_weights=reference_physics,
             reference_fit_indices=reference_fit_indices,
             class_names=class_names,
-            pca_kernel=pca_kernel,
-            pca_gamma=pca_gamma,
-            pca_kernel_fit_samples=pca_kernel_fit_samples,
         )
         if reference_pt:
             reference_md = []
-            for _cls, kpca_c in class_transforms:
-                transformed = _kernel_whiten(kpca_c, reference_latents)
+            for _cls, mu_c, W_c in class_transforms:
+                transformed = _linear_whiten(mu_c, W_c, reference_latents)
                 reference_md.append((transformed * transformed).sum(axis=1))
             reference_axis2 = np.stack(reference_md, axis=0).min(axis=0)
 
@@ -693,17 +644,15 @@ def ABCD(config):
     print(f"Events after masking: {mask.sum()}", flush=True)
 
     if not use_logit:
-        emb_pca   = _kernel_whiten(md_kpca, latents_masked)
+        emb_pca   = _linear_whiten(md_mu, md_W, latents_masked)
         n_pca     = emb_pca.shape[1]
         axis2_pca = axis2_bkg
     else:
-        # still compute a KernelPCA of the latent for the embedding plots
-        _pca_fit = fit_class_kernel_transform(
+        # still compute a linear PCA of the latent for the embedding plots
+        _pca_mu, _pca_W = fit_class_transform(
             latents_masked, labels_masked == qcd_label,
-            min(6, latents_masked.shape[1]), class_names.get(qcd_label, "QCD"),
-            kernel=pca_kernel, gamma=pca_gamma,
-            fit_sample_cap=pca_kernel_fit_samples)
-        emb_pca   = _kernel_whiten(_pca_fit, latents_masked)
+            min(6, latents_masked.shape[1]), class_names.get(qcd_label, "QCD"))
+        emb_pca   = _linear_whiten(_pca_mu, _pca_W, latents_masked)
         n_pca     = emb_pca.shape[1]
         axis2_pca = axis2_bkg   # same axis in logit mode
 
@@ -711,92 +660,6 @@ def ABCD(config):
     axis1_qcd = axis1_bkg[qcd_only]
     axis2_qcd = axis2_bkg[qcd_only]
     print(f"QCD events for ABCD: {qcd_only.sum()}", flush=True)
-
-    # ── axis-2 tail diagnostic: kernel-PCA MD is bounded (RBF similarity to
-    # every reference point vanishes for far events), unlike linear-PCA MD.
-    # A saturation plateau shows up here as many tied values at the top of
-    # the range, which quantile thresholds can't split -- that's the flat
-    # band the 2D closure scan shows near high p1/p2.
-    if not use_logit:
-        n_feat = latents_masked.shape[1]
-        effective_gamma = pca_gamma if pca_gamma is not None else 1.0 / n_feat
-        max_val = float(axis2_qcd.max())
-        n_tied_at_max = int(np.isclose(axis2_qcd, max_val, rtol=0, atol=1e-6).sum())
-        top1pct = np.quantile(axis2_qcd, 0.99)
-        tail = axis2_qcd[axis2_qcd >= top1pct]
-        n_unique_tail = np.unique(tail).size
-        print(
-            f"Axis2 (QCD) tail check [{pca_kernel} kernel, gamma={effective_gamma:.4g}]: "
-            f"max={max_val:.4g}, {n_tied_at_max} events tied at max, "
-            f"{n_unique_tail}/{tail.size} unique values above the p99 threshold",
-            flush=True)
-        wandb.log({
-            "Diag/axis2_qcd_max": max_val,
-            "Diag/axis2_qcd_n_tied_at_max": n_tied_at_max,
-            "Diag/axis2_qcd_tail_unique_frac": n_unique_tail / max(tail.size, 1),
-        })
-
-        # Full-range plateau check: the p99 tail check above only covers the
-        # top 1%, so a tied cluster sitting mid-range (e.g. a large block of
-        # QCD events collapsing onto ~the same MD score around p88) wouldn't
-        # show up there. That's exactly the shape a scan-axis cutoff at a
-        # fixed percentile (independent of the other axis) would need: once
-        # the scan crosses into the tied block, the actual threshold value
-        # stops moving and the region composition can flip abruptly.
-        qs = [0.50, 0.60, 0.70, 0.80, 0.84, 0.86, 0.87, 0.88, 0.89, 0.90, 0.92, 0.95, 0.98]
-        qvals = np.quantile(axis2_qcd, qs)
-        print(
-            "Axis2 (QCD) quantile ladder: "
-            + ", ".join(f"p{q:.2f}={v:.6g}" for q, v in zip(qs, qvals)),
-            flush=True)
-
-        sorted_axis2 = np.sort(axis2_qcd)
-        uniq_vals, uniq_counts = np.unique(sorted_axis2, return_counts=True)
-        top_cluster_idx = np.argsort(uniq_counts)[::-1][:5]
-        print("Largest tied clusters in axis2 (QCD):", flush=True)
-        for idx in top_cluster_idx:
-            v, c = uniq_vals[idx], uniq_counts[idx]
-            lo = np.searchsorted(sorted_axis2, v, side="left") / sorted_axis2.size
-            hi = np.searchsorted(sorted_axis2, v, side="right") / sorted_axis2.size
-            print(
-                f"  value={v:.6g} count={c} ({100.0*c/sorted_axis2.size:.2f}%) "
-                f"percentile span=[{lo:.3f}, {hi:.3f}]",
-                flush=True)
-        biggest_idx = top_cluster_idx[0]
-        wandb.log({
-            "Diag/axis2_qcd_biggest_cluster_value": float(uniq_vals[biggest_idx]),
-            "Diag/axis2_qcd_biggest_cluster_frac": float(uniq_counts[biggest_idx]) / sorted_axis2.size,
-        })
-
-        # Eigenvalue spectrum of the fitted QCD whitening transform -- a
-        # near-zero eigenvalue divides by ~0 in _kernel_whiten and amplifies
-        # noise along that direction instead of saturating; that's a
-        # different failure mode (spiky, not tied) with a different fix
-        # (fewer components / larger fit sample) than kernel saturation.
-        eigvals = md_kpca.eigenvalues_
-        print(
-            f"QCD KernelPCA eigenvalues: min={eigvals.min():.4g}, "
-            f"max={eigvals.max():.4g}, ratio={eigvals.max() / max(eigvals.min(), 1e-12):.4g}",
-            flush=True)
-        wandb.log({
-            "Diag/qcd_kpca_eig_min": float(eigvals.min()),
-            "Diag/qcd_kpca_eig_max": float(eigvals.max()),
-        })
-
-        fig, ax = plt.subplots(figsize=(7, 5))
-        bins = (np.geomspace(axis2_qcd[axis2_qcd > 0].min(), max_val, 101)
-                if axis2_log_scale else np.linspace(axis2_qcd.min(), max_val, 101))
-        ax.hist(axis2_qcd, bins=bins)
-        if axis2_log_scale:
-            ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel(axis2_label)
-        ax.set_ylabel("QCD events")
-        ax.set_title(f"Axis2 tail diagnostic ({pca_kernel} kernel, gamma={effective_gamma:.4g})")
-        out_diag = os.path.join(plot_dir, "axis2_qcd_tail_diag.png")
-        fig.savefig(out_diag, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        wandb.log({"Diag/axis2_qcd_hist": wandb.Image(out_diag)})
 
     # ── gen weights (QCD only, for weighted ABCD) ─────────────────────────────
     gen_weights_qcd = None
@@ -850,8 +713,8 @@ def ABCD(config):
         else:
             sig_latents, sig_raw_labels = embed_pf(model, config["signal_pt"], device)
             sig_mds = []
-            for cls, kpca_c in class_transforms:
-                z_c = _kernel_whiten(kpca_c, sig_latents)
+            for cls, mu_c, W_c in class_transforms:
+                z_c = _linear_whiten(mu_c, W_c, sig_latents)
                 sig_mds.append((z_c * z_c).sum(axis=1))
             sig_con = np.stack(sig_mds, axis=0).min(axis=0).astype(np.float32)
 
@@ -861,10 +724,10 @@ def ABCD(config):
         sig_latents_masked = sig_latents[sig_mask]
         sig_labels_masked  = sig_raw_labels[sig_mask]
         if not use_logit:
-            sig_emb_pca   = _kernel_whiten(md_kpca, sig_latents_masked)
+            sig_emb_pca   = _linear_whiten(md_mu, md_W, sig_latents_masked)
             sig_axis2_pca = (sig_emb_pca * sig_emb_pca).sum(axis=1).astype(np.float32)
         else:
-            sig_emb_pca   = _kernel_whiten(_pca_fit, sig_latents_masked)
+            sig_emb_pca   = _linear_whiten(_pca_mu, _pca_W, sig_latents_masked)
             sig_axis2_pca = sig_axis2
         print(f"Signal events after masking: {sig_mask.sum()}", flush=True)
 
@@ -1143,10 +1006,10 @@ def ABCD(config):
         handles = plot_kde_contours(ax, groups, log_x=True, log_y=True)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlabel("AE reco loss", fontsize=fs)
-        ax.set_ylabel("NURD Contrastive score (kernel PCA-MD)", fontsize=fs)
+        ax.set_ylabel("NURD Contrastive score (PCA-MD)", fontsize=fs)
         ax.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
         ax.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
-        ax.set_title("AE vs kernel PCA-MD — KDE contours")
+        ax.set_title("AE vs PCA-MD — KDE contours")
         ax.legend(handles=handles, fontsize=fs_legend)
         plt.tick_params(axis="x", labelsize=fs_leg)
         plt.tick_params(axis="y", labelsize=fs_leg)
@@ -1155,15 +1018,14 @@ def ABCD(config):
         fig.savefig(out_pca_kde, dpi=200, bbox_inches="tight"); plt.close(fig)
         wandb.log({"Hists2D/pca_md_kde": wandb.Image(out_pca_kde)})
 
-    # PCA embedding KDE contours (2D kernel PCA, fit on QCD)
+    # PCA embedding KDE contours (2D linear PCA, fit on QCD)
     if not config.get("skip_embedding_pca"):
-        emb2_fit = fit_class_kernel_transform(
+        emb2_mu, emb2_W = fit_class_transform(
             latents_masked, labels_masked == qcd_label, 2,
-            class_names.get(qcd_label, "QCD"), kernel=pca_kernel, gamma=pca_gamma,
-            fit_sample_cap=pca_kernel_fit_samples)
-        emb_2d = _kernel_whiten(emb2_fit, latents_masked)
+            class_names.get(qcd_label, "QCD"))
+        emb_2d = _linear_whiten(emb2_mu, emb2_W, latents_masked)
         sig_emb_2d = (
-            _kernel_whiten(emb2_fit, sig_latents_masked)
+            _linear_whiten(emb2_mu, emb2_W, sig_latents_masked)
             if sig_latents_masked is not None else None)
 
         fig, ax = plt.subplots(figsize=fig_size)
@@ -1178,9 +1040,9 @@ def ABCD(config):
                     continue
                 groups.append((sig_class_names[lbl], sig_class_colors[lbl], sig_emb_2d[sm, 0], sig_emb_2d[sm, 1]))
         handles = plot_kde_contours(ax, groups, log_x=False, log_y=False)
-        ax.set_xlabel("Kernel PCA Component 1", fontsize=fs)
-        ax.set_ylabel("Kernel PCA Component 2", fontsize=fs)
-        ax.set_title(f"NURD latent — kernel PCA KDE contours (fit on {class_names.get(qcd_label, 'QCD')})")
+        ax.set_xlabel("PCA Component 1", fontsize=fs)
+        ax.set_ylabel("PCA Component 2", fontsize=fs)
+        ax.set_title(f"NURD latent — PCA KDE contours (fit on {class_names.get(qcd_label, 'QCD')})")
         ax.legend(handles=handles, fontsize=fs_legend)
         plt.tick_params(axis="x", labelsize=fs_leg)
         plt.tick_params(axis="y", labelsize=fs_leg)
@@ -1213,7 +1075,7 @@ def ABCD(config):
             ax.legend(handles=handles, fontsize=fs_legend)
             ax.tick_params(axis="both", labelsize=fs_leg)
         fig.suptitle(
-            "Kernel PCA-MD space — pairwise components, KDE contours "
+            "PCA-MD space — pairwise components, KDE contours "
             f"(NURD latent, fit on {class_names.get(qcd_label, 'QCD')})", fontsize=fs)
         plt.tight_layout()
         out_corner = os.path.join(plot_dir, "pca_corner.png")
@@ -1242,13 +1104,12 @@ def ABCD(config):
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        baseline_kpca = fit_class_kernel_transform(
+        baseline_mu, baseline_W = fit_class_transform(
             baseline_latents_masked, labels_masked == qcd_label, 2,
-            class_names.get(qcd_label, "QCD"), kernel=pca_kernel, gamma=pca_gamma,
-            fit_sample_cap=pca_kernel_fit_samples)
-        baseline_emb_2d = _kernel_whiten(baseline_kpca, baseline_latents_masked)
+            class_names.get(qcd_label, "QCD"))
+        baseline_emb_2d = _linear_whiten(baseline_mu, baseline_W, baseline_latents_masked)
         baseline_sig_emb_2d = (
-            _kernel_whiten(baseline_kpca, baseline_sig_latents_masked)
+            _linear_whiten(baseline_mu, baseline_W, baseline_sig_latents_masked)
             if baseline_sig_latents_masked is not None else None)
 
         groups = [
@@ -1266,10 +1127,10 @@ def ABCD(config):
 
         fig, ax = plt.subplots(figsize=fig_size)
         handles = plot_kde_contours(ax, groups, log_x=False, log_y=False)
-        ax.set_xlabel("Kernel PCA Component 1", fontsize=fs)
-        ax.set_ylabel("Kernel PCA Component 2", fontsize=fs)
+        ax.set_xlabel("PCA Component 1", fontsize=fs)
+        ax.set_ylabel("PCA Component 2", fontsize=fs)
         ax.set_title("NURD latent, no decorrelation (contrastive-only baseline) "
-                     f"— kernel PCA KDE contours (fit on {class_names.get(qcd_label, 'QCD')})")
+                     f"— PCA KDE contours (fit on {class_names.get(qcd_label, 'QCD')})")
         ax.legend(handles=handles, fontsize=fs_legend)
         plt.tick_params(axis="x", labelsize=fs_leg)
         plt.tick_params(axis="y", labelsize=fs_leg)
@@ -1476,19 +1337,10 @@ if __name__ == "__main__":
                         help="Optional second NURD checkpoint trained with "
                              "--lambda_info 0 (contrastive-only, no decorrelation "
                              "pressure). Its latents are embedded separately and "
-                             "plotted as a kernel-PCA KDE comparison "
+                             "plotted as a PCA KDE comparison "
                              "(pca_no_decorrelation_kde.png) against --ckpt's "
                              "decorrelated latents -- it plays no role in the ABCD "
                              "closure statistic itself.")
-    parser.add_argument("--pca_kernel",   default="rbf",
-                        help="Kernel for sklearn.decomposition.KernelPCA "
-                             "(used for MD whitening and all PCA embedding plots)")
-    parser.add_argument("--pca_gamma",    type=float, default=None,
-                        help="KernelPCA gamma (default: sklearn's 1/n_features heuristic)")
-    parser.add_argument("--pca_kernel_fit_samples", type=int, default=5000,
-                        help="Per-class subsample size used to fit each KernelPCA "
-                             "(fit cost is quadratic in this; transform is applied "
-                             "to the full sample and is linear)")
     parser.add_argument("--class_names",  default=None,
                         help="Comma-separated background class names ordered by "
                              "label index (matches the double_disco_hlt data "
